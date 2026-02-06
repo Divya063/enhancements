@@ -135,6 +135,7 @@ As a developer, I can make use of cgroup knobs that are not supported yet in Kub
 - **cgroup v2 Only**: This feature requires cgroup v2 and will return an error on cgroup v1 systems
 - **Linux Only**: The field is only valid on Linux containers and will be validated accordingly
 - **Runtime Support**: Requires container runtime support
+- **Node Configuration**: The host's cgroup v2 filesystem must be mounted with the `nsdelegate` option for this feature to function safely.
 - **Security Context Integration**: Must work cohesively with other SecurityContext fields
 
 ### Risks and Mitigations
