@@ -12,9 +12,6 @@
   - [Notes/Constraints/Caveats (Optional)](#notesconstraintscaveats-optional)
   - [Risks and Mitigations](#risks-and-mitigations)
   - [cpuset Isolation](#cpuset-isolation)
-    - [Option 1: nsdelegate Mount Option (Recommended)](#option-1-nsdelegate-mount-option-recommended)
-    - [Option 2: Subdirectory Delegation (crun model)](#option-2-subdirectory-delegation-crun-model)
-    - [Option 3: Enhanced Reconciler Verification](#option-3-enhanced-reconciler-verification)
 - [Design Details](#design-details)
   - [API Changes](#api-changes)
     - [Core API Types](#core-api-types)
@@ -146,35 +143,17 @@ As a developer, I can make use of cgroup knobs that are not supported yet in Kub
 | **Pod Security Policy Bypass**: Feature being used in restricted environments | Integration with Pod Security Standards to block in restricted profiles |
 | **Intra-Pod Resource Starvation**: A container in a Burstable or BestEffort Pod could modify its cgroup limits to consume resources intended for other containers in the same Pod. | With `nsdelegate` or subdirectory delegation, containers cannot modify their own limits - only create child cgroups. Guaranteed QoS is **not required** as the kernel enforces hierarchical constraints. | 
 | **Runtime Incompatibility**: Feature not working with older runtimes | Graceful degradation - field ignored if runtime doesn't support it |
-| **cpuset Isolation**: Containers could modify `cpuset.cpus` to access CPUs allocated to other workloads by CPU Manager. | Two mitigation options available. See [Security: cpuset/memset Isolation](#cpuset-isolation) section. |
+| **cpuset Isolation**: Containers could modify `cpuset.cpus` to access CPUs allocated to other workloads by CPU Manager. | The `nsdelegate` mount option for cgroup v2 prevents containers from modifying their own resource limits (like `cpuset.cpus`). They can only create and manage sub-cgroups within their allocated constraints. |
 
 ### cpuset Isolation
 
-**Problem**: CPU Manager sets `cpuset.cpus` only at container level, not at pod level. The pod-level cgroup has no cpuset constraint:
+**Problem**: If a container has write access to its cgroup directory, it might attempt to modify sensitive resource limits like `cpuset.cpus` to access CPUs allocated to other workloads.
 
-**Mitigation Options**:
+**Mitigation**:
 
-#### Option 1: nsdelegate Mount Option (Recommended)
+The `nsdelegate` mount option for cgroup v2 provides kernel-level protection. When `/sys/fs/cgroup` is mounted with `nsdelegate`, and the container is in its own cgroup namespace, the kernel prevents the container from modifying its own resource limits. It can only create subdirectories (child cgroups) and manage resources within those sub-cgroups.
 
-The `nsdelegate` mount option for cgroup2 provides kernel-level protection. When `/sys/fs/cgroup` is mounted with `nsdelegate`, containers in their own cgroup namespace cannot modify their own resource limits but can create subdirectories for child cgroups. With the `nsdelegate` mount option or subdirectory delegation approach, Guaranteed QoS class is not required for writable cgroups:
-
-**Caveat**: The `nsdelegate` option only has an effect when performed in the initial mount namespace. This requires cluster administrators to configure nodes with the appropriate mount options.
-
-#### Option 2: Subdirectory Delegation (crun model)
-
- The runtime can implement safe delegation by creating a subdirectory inside the container's cgroup:
-
-1. Create a subdirectory (e.g., `/sys/fs/cgroup/.../container/user/`)
-2. Enable `cgroup.subtree_control` on the parent
-3. Move the container process to the subdirectory
-4. Chown only the subdirectory and delegatable files (`cgroup.procs`, `cgroup.subtree_control`)
-5. Parent's controller files (`cpu.max`, `cpuset.cpus`) remain root-owned
-
-Since containers cannot escape parent cpuset limits by creating child cgroups (the kernel enforces hierarchical constraints), this approach provides the necessary security guarantees. This is similar to crun's `run.oci.delegate-cgroup` annotation implementation.
-
-#### Option 3: Enhanced Reconciler Verification
-
-Extend the CPU Manager reconciler to verify and reset container cpuset values by reading the actual cpuset from the cgroup and comparing it to the desired state. Runtime enforcement would be done at reconciliation frequency (default: 10s, configurable via `--cpu-manager-reconcile-period`).
+This feature relies on `nsdelegate` being supported and configured on the host. If the runtime cannot ensure this isolation (e.g., missing `nsdelegate` support), it MUST NOT enable writable cgroups for the container.
 
 ## Design Details
 
