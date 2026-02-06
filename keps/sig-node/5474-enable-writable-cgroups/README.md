@@ -74,7 +74,7 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 
 ## Summary
 
-This KEP proposes adding a `CgroupOptions` struct field to the container SecurityContext in Kubernetes to allow unprivileged containers to have writable access to cgroup interfaces on cgroup v2 systems. The struct-based approach provides extensibility for future cgroup-related configurations.
+This KEP proposes adding a `CgroupOptions` struct field to the container SecurityContext in Kubernetes to allow unprivileged containers to have writable access to cgroup interfaces on cgroup v2 systems. This feature relies on the kernel's `nsdelegate` mount option to ensure containers can only manage their own cgroup subtrees, preventing unauthorized access to system resources. The explicit API field is required to provide visibility, policy enforcement, and defense-in-depth for this capability.
 
 ## Motivation
 
@@ -626,6 +626,7 @@ New pods with `cgroupOptions.mountMode: Writable` can be created again. No data 
 ## Implementation History
 
 - **2025-08-25**: KEP written and proposed
+- **2026-02-05**: KEP refined to focus strictly on `nsdelegate` for isolation and justify API opt-in requirements
 - **TBD**: Alpha implementation targeting v1.36
 - **TBD**: Beta implementation targeting v1.37
 - **TBD**: GA implementation targeting v1.38
