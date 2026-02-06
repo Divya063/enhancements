@@ -144,7 +144,6 @@ As a developer, I can make use of cgroup knobs that are not supported yet in Kub
 | **Security Bypass**: Containers gaining unauthorized access to system cgroups | Only allow write access to container's own cgroup subtree. cgroup v2 delegation model provides isolation |
 | **Resource Exhaustion**: Containers setting inappropriate resource limits | Kubernetes resource quotas and limit ranges still apply. Container cannot exceed pod-level limits |
 | **Pod Security Policy Bypass**: Feature being used in restricted environments | Integration with Pod Security Standards to block in restricted profiles |
-| **Intra-Pod Resource Starvation**: A container in a Burstable or BestEffort Pod could modify its cgroup limits to consume resources intended for other containers in the same Pod. | With `nsdelegate` or subdirectory delegation, containers cannot modify their own limits - only create child cgroups. Guaranteed QoS is **not required** as the kernel enforces hierarchical constraints. | 
 | **Runtime Incompatibility**: Feature not working with older runtimes | Graceful degradation - field ignored if runtime doesn't support it |
 | **cpuset Isolation**: Containers could modify `cpuset.cpus` to access CPUs allocated to other workloads by CPU Manager. | The `nsdelegate` mount option for cgroup v2 prevents containers from modifying their own resource limits (like `cpuset.cpus`). They can only create and manage sub-cgroups within their allocated constraints. |
 
@@ -380,27 +379,6 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 }
 ```
 
-
-**QoS Class Validation**:
-
-```go
-func ValidatePodSpec(spec *core.PodSpec, podMeta metav1.Object, fldPath *field.Path, opts PodValidationOptions) field.ErrorList {
-    allErrs := field.ErrorList{}
-    
-    // Check if any container has CgroupOptions.MountMode: Writable
-    if hasWritableCgroupOptions {
-        tempPod := &core.Pod{Spec: *spec}
-        qosClass := qos.ComputePodQOS(tempPod)
-        if qosClass != core.PodQOSGuaranteed {
-            allErrs = append(allErrs, field.Invalid(fldPath, spec, 
-                "CgroupOptions.MountMode=Writable requires Guaranteed QoS class (equal CPU/memory requests and limits for all containers)"))
-        }
-    }
-    
-    return allErrs
-}
-```
-
 ### Test Plan
 
 [x] I/we understand the owners of the involved components may require updates to
@@ -434,7 +412,6 @@ Coverage for new and existing packages:
   - Multi-container pods with mixed settings
   - Integration with other SecurityContext fields
   - cgroup v2 requirement validation
-  - Pod validation failing for containers with CgroupOptions but not "Guaranteed" QoS
   - Containers not able to "escape" the resource limits set by the Pod
   - Runtime compatibility checks
 
