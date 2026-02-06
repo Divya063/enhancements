@@ -42,6 +42,7 @@
 - [Alternatives](#alternatives)
   - [Alternative 1: Runtime-specific Annotations](#alternative-1-runtime-specific-annotations)
   - [Alternative 2: Boolean Field Instead of Struct](#alternative-2-boolean-field-instead-of-struct)
+  - [Alternative 3: Runtime Auto-Detection (Implicit Behavior)](#alternative-3-runtime-auto-detection-implicit-behavior)
 - [Infrastructure Needed (Optional)](#infrastructure-needed-optional)
 <!-- /toc -->
 
@@ -80,6 +81,8 @@ This KEP proposes adding a `CgroupOptions` struct field to the container Securit
  With cgroup v2's secure delegation model, unprivileged containers can safely manage their own cgroup subtree without compromising system security. To support this, a configuration option can be introduced to ensure that, when cgroup v2 is enabled, the cgroup interface (/sys/fs/cgroup) is mounted with read-write permissions for containers.
 
 By exposing the `CgroupOptions` field through the Kubernetes API and CRI interface, container runtimes can be updated to honor the setting via CRI, enabling unprivileged containers to take advantage of writable cgroups in a secure manner.
+
+While the `nsdelegate` mount option makes this safe from a kernel isolation perspective, it represents a significant change in the container's capabilities. Requiring an explicit opt-in via the API ensures this capability is visible to cluster administrators, can be restricted via policy (e.g., Pod Security Standards), and maintains the principle of defense-in-depth by keeping the default secure and restricted.
 
 Related Issues:
 - https://github.com/containerd/containerd/issues/10924
@@ -687,6 +690,19 @@ securityContext:
 - Not extensible for future cgroup-related configurations
 
 The struct-based approach (`CgroupOptions`) was chosen to allow future extensibility.
+
+### Alternative 3: Runtime Auto-Detection (Implicit Behavior)
+
+Instead of a new API field, container runtimes could automatically detect if the host has `nsdelegate` enabled and, if so, mount cgroups as read-write.
+
+**Pros**:
+- No API changes required.
+- "It just works" for configured nodes.
+
+**Cons**:
+- **Lack of Visibility**: Cluster administrators cannot easily identify which workloads are using this capability.
+- **Policy Enforcement**: Admission controllers and security policies cannot restrict usage since it's not in the Pod spec.
+- **Defense in Depth**: It removes a layer of defense. Even if `nsdelegate` is safe, keeping the default restricted protects against potential kernel bugs or implementation flaws.
 
 ## Infrastructure Needed (Optional)
 
