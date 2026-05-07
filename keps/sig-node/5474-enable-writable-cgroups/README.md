@@ -549,110 +549,167 @@ New pods with `cgroupOptions.mountMode: Writable` can be created again. No data 
 
 ### Rollout, Upgrade and Rollback Planning
 
-
+This section complements [Feature Enablement and Rollback](#feature-enablement-and-rollback) above with rollout-specific failure modes.
 
 ###### How can a rollout or rollback fail? Can it impact already running workloads?
 
+Possible rollout failure modes:
 
+- **Version skew (apiserver enabled, kubelet not)**: The apiserver accepts the field, but a kubelet running a version without the feature gate (or without the field) will not honor it. Pods schedule and start, but cgroups remain read-only, so workloads that need to create cgroups at runtime will not be able to.
+- **Runtime missing CRI support**: If the container runtime does not advertise `supports_cgroup_options` via `RuntimeHandlerFeatures`, the kubelet rejects the pod with a clear error and the pod stays in `ContainerCreating`. No impact on other pods.
+- **Host missing cgroup v2 or `nsdelegate`**: The kubelet rejects the pod with a validation error indicating the requirement. No impact on other pods.
+
+Rollback (disabling the feature gate):
+
+- New pods with `cgroupOptions.mountMode: Writable` are rejected by the apiserver.
+- Existing running containers with writable cgroups continue to run with their current mount until the container restarts. After restart, if the gate is off, the container starts with read-only cgroups (which may break workloads that depend on writability).
+
+No impact on workloads that do not opt in to the feature.
 
 ###### What specific metrics should inform a rollback?
 
+No dedicated metrics for alpha. Existing kubelet pod-startup counters (`kubelet_started_pods_errors_total`, `kubelet_runtime_operations_errors_total`) do not carry a feature-level label that can isolate this feature's impact, so operators should:
+
+- Audit which pods opt in (see the kubectl query under [Monitoring Requirements](#monitoring-requirements)).
+- Watch the `FailedNodeDeclaredFeaturesCheck` event on those pods, which the kubelet emits when a pod requires a node feature that is not advertised by the runtime.
+- Track restart rates for opted-in pods.
+
+Whether to add a feature-specific dimension to existing counters is deferred to beta, contingent on observed adoption.
 
 ###### Were upgrade and rollback tested? Was the upgrade->downgrade->upgrade path tested?
 
+TODO: requires the alpha implementation in kubernetes/kubernetes and a container runtime supporting the new CRI field. Plan: implement in kubernetes and containerd, then exercise the upgrade -> downgrade -> upgrade flow in `kind` (cheap to swap node images and flip feature gates). Cases to cover:
 
+- Enable feature gate, create pod with `cgroupOptions.mountMode: Writable`, confirm container has writable `/sys/fs/cgroup`.
+- Disable feature gate, confirm apiserver rejects new pods with the field, confirm previously-running pods continue until restart.
+- Re-enable feature gate, confirm new pods can be created again.
+
+True version downgrade behavior (to a kubernetes version without the field) is described under [Upgrade / Downgrade Strategy](#upgrade--downgrade-strategy).
 
 ###### Is the rollout accompanied by any deprecations and/or removals of features, APIs, fields of API types, flags, etc.?
 
+No.
 
 
 ### Monitoring Requirements
 
-
-
 ###### How can an operator determine if the feature is in use by workloads?
 
+By inspecting Pod specs:
 
+```
+kubectl get pods -A -o json \
+  | jq '.items[] | select(.spec.containers[]?.securityContext.cgroupOptions.mountMode == "Writable") | {namespace: .metadata.namespace, name: .metadata.name}'
+```
+
+This follows the alpha pattern used by KEP-3857 (recursive read-only mounts) and KEP-4639 (OCI volume source). A dedicated metric can be considered at beta if there is demand.
 
 ###### How can someone using this feature know that it is working for their instance?
 
+From inside the container:
 
+- `mount | grep '^cgroup2'` should show `/sys/fs/cgroup` mounted with `rw`.
+- `mkdir /sys/fs/cgroup/test && rmdir /sys/fs/cgroup/test` should succeed.
 
-- [ ] Events
-  - Event Reason: 
+If the runtime does not advertise `supports_cgroup_options` via `RuntimeHandlerFeatures`, the kubelet emits a [`FailedNodeDeclaredFeaturesCheck`](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/events/event.go#L42) event on the pod, the existing pattern for "pod requires a node feature that is not available." If the host is on cgroup v1 or lacks `nsdelegate`, pod startup fails with a kubelet validation error identifying the cause.
+
+- [x] Events
+  - Event Reason: `FailedNodeDeclaredFeaturesCheck` when the runtime handler does not advertise `supports_cgroup_options`.
 - [ ] API .status
-  - Condition name: 
-  - Other field: 
 - [ ] Other (treat as last resort)
-  - Details:
 
 ###### What are the reasonable SLOs (Service Level Objectives) for the enhancement?
 
+No dedicated SLOs at alpha. The feature does not add work to the pod-startup hot path beyond the runtime-support check described under [Scalability](#scalability), so existing pod startup SLOs continue to apply unchanged.
 
+Beta will revisit whether a startup-latency SLO scoped to opted-in pods is warranted.
 
 ###### What are the SLIs (Service Level Indicators) an operator can use to determine the health of the service?
 
+For alpha, existing kubelet SLIs apply:
 
+- `kubelet_pod_start_duration_seconds`
+- `kubelet_started_pods_errors_total`
 
 - [ ] Metrics
-  - Metric name:
-  - [Optional] Aggregation method:
-  - Components exposing the metric:
-- [ ] Other (treat as last resort)
-  - Details:
+- [x] Other (treat as last resort)
+  - Details: For alpha, rely on existing kubelet metrics combined with pod-spec audit (above) and the `FailedNodeDeclaredFeaturesCheck` event for per-pod failure attribution.
 
 ###### Are there any missing metrics that would be useful to have to improve observability of this feature?
 
+None planned for alpha. The dominant pattern for SecurityContext-adjacent alpha features (KEP-3857, KEP-4639, KEP-2400) is to defer dedicated metrics until beta. If beta uptake reveals a need for fleet-wide visibility, candidates to consider are: a per-feature label on existing pod-startup counters, or a dedicated `kubelet_writable_cgroup_pods` gauge (matching the KEP-127 pattern, which added `started_user_namespaced_pods_total` at beta).
 
 
 ### Dependencies
 
-
-
 ###### Does this feature depend on any specific services running in the cluster?
 
+No new in-cluster services. The feature depends on:
+
+- A Linux kernel with cgroup v2 support.
+- The host's `/sys/fs/cgroup` mounted with the `nsdelegate` option (the default in modern systemd; required for safe operation, see [cpuset Isolation](#cpuset-isolation)).
+- A container runtime that supports the new CRI `cgroup_mount_mode` field and advertises `supports_cgroup_options` via `RuntimeHandlerFeatures`.
 
 ### Scalability
 
-
 ###### Will enabling / using this feature result in any new API calls?
 
-
+No.
 
 ###### Will enabling / using this feature result in introducing new API types?
 
-
+No new top-level types. The feature adds a nested `CgroupOptions` struct and a `CgroupMountMode` string enum inside the existing `SecurityContext`.
 
 ###### Will enabling / using this feature result in any new calls to the cloud provider?
 
-
+No.
 
 ###### Will enabling / using this feature result in increasing size or count of the existing API objects?
 
-
+Marginal. Pods opting in to the feature add a small nested object containing a single string enum to their spec. Pods that do not opt in are unchanged.
 
 ###### Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?
 
-
+No measurable impact. The per-pod runtime-support check is a linear scan of the kubelet's [`runtimeState.rtHandlers`](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/runtime.go#L39) slice, mirroring the existing [`runtimeHandlerSupportsRecursiveReadOnlyMounts`](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/kubelet_pods.go#L2903) lookup. The slice cardinality equals the number of runtime handlers configured on the node, typically a single-digit number.
 
 ###### Will enabling / using this feature result in non-negligible increase of resource usage (CPU, RAM, disk, IO, ...) in any components?
 
+No new background controllers, watchers, or periodic work. Resource consumption from cgroups created inside an opted-in container is bounded by runtime-enforced descendant and depth limits (see resource exhaustion discussion below).
 
 ###### Can enabling / using this feature result in resource exhaustion of some node resources (PIDs, sockets, inodes, etc.)?
 
+Yes, without mitigation. A misbehaving or malicious container with writable cgroups can create many descendant cgroups; the resulting node-level resource consumption is not counted against the container's `memory.max` limit, so the container's own memory limit does not bound it (see [Verified Behavior](#verified-behavior)).
+
+Mitigations:
+
+- The kubelet sends `cgroup_max_descendants` and `cgroup_max_depth` via CRI when `mountMode: Writable` is enabled; the runtime applies these on the container's cgroup before mounting.
+- The kubelet uses conservative defaults at alpha; optional Pod-spec overrides are added at beta and require no further CRI changes since the fields are already in the alpha CRI surface.
+- The feature is opt-in via `cgroupOptions.mountMode: Writable`, so cluster administrators can restrict usage via Pod Security Standards or admission policies.
 
 
 ### Troubleshooting
 
-
-
 ###### How does this feature react if the API server and/or etcd is unavailable?
+
+No different from existing pod creation. If the apiserver is unavailable, no new pods (including those opting in to writable cgroups) can be created. Pods already running with writable cgroups are unaffected; the feature has no runtime dependency on the control plane after pod startup.
 
 ###### What are other known failure modes?
 
-
+| Failure | Detection | Mitigations | Diagnostics | Testing |
+|---|---|---|---|---|
+| Container runtime does not support the CRI field | Pod stuck in `ContainerCreating`; kubelet event indicates runtime does not support `CgroupOptions` | Use a runtime advertising `supports_cgroup_options`; or remove the field from the pod spec | kubelet logs; pod events | unit + integration tests |
+| Host is on cgroup v1 | Pod startup fails with kubelet validation error: `CgroupOptions.MountMode=Writable requires cgroup v2` | Migrate the node to cgroup v2; or remove the field from the pod spec | kubelet logs; pod events | e2e on cgroup v1 nodes |
+| Host's `/sys/fs/cgroup` is not mounted with `nsdelegate` | Container can write to its own root-of-namespace controller files, breaking the isolation guarantee this feature relies on | Mount `/sys/fs/cgroup` with `nsdelegate` on the host (the default in modern systemd); the runtime MUST refuse to enable writable cgroups otherwise | inspect mount options on the host with `findmnt /sys/fs/cgroup` | runtime contract; e2e validates `nsdelegate` is present |
+| Container creates excessive descendant cgroups | `mkdir` returns `EAGAIN` once `cgroup.max.descendants` is hit; node `Slab` and `MemAvailable` remain stable when runtime defaults are in place | Runtime-enforced `cgroup.max.descendants` and `cgroup.max.depth` defaults; without these defaults, a container can drive the node into `NotReady` (see [Verified Behavior](#verified-behavior)) | container logs; node `/proc/meminfo` `Slab`; `cat /sys/fs/cgroup/cgroup.stat` | e2e for descendant bound |
 
 ###### What steps should be taken if SLOs are not being met to determine the problem?
+
+No SLOs at alpha. If pod startup latency degrades after enabling the feature gate:
+
+1. Check kubelet logs for `CgroupOptions` validation errors.
+2. Confirm the runtime handler advertises `SupportsCgroupOptions: true` via `kubectl get node -o yaml`.
+3. Confirm the host has cgroup v2 with `nsdelegate` (`findmnt /sys/fs/cgroup`).
+4. Disable the feature gate as a rollback.
 
 ## Implementation History
 
