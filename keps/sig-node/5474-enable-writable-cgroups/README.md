@@ -11,6 +11,7 @@
   - [Notes/Constraints/Caveats (Optional)](#notesconstraintscaveats-optional)
   - [Risks and Mitigations](#risks-and-mitigations)
   - [cpuset Isolation](#cpuset-isolation)
+  - [Verified Behavior](#verified-behavior)
 - [Design Details](#design-details)
   - [API Changes](#api-changes)
     - [Core API Types](#core-api-types)
@@ -131,6 +132,7 @@ Another example is, [KubeVirt](https://github.com/kubevirt/kubevirt) runs a hype
 - **Linux Only**: The field is only valid on Linux containers and will be validated accordingly
 - **Runtime Support**: Requires container runtime support
 - **Node Configuration**: The host's cgroup v2 filesystem must be mounted with the `nsdelegate` option for this feature to function safely.
+- **Descendant Limits**: When `mountMode: Writable` is enabled, the kubelet sends `cgroup_max_descendants` and `cgroup_max_depth` to the runtime via CRI; the runtime applies these on the container's cgroup before mounting `/sys/fs/cgroup`. The kubelet sends conservative defaults at alpha; user-tunable overrides via the Pod spec are added at beta and require no further CRI changes. This prevents unbounded cgroup creation from exhausting node resources; see [Verified Behavior](#verified-behavior).
 - **Security Context Integration**: Must work cohesively with other SecurityContext fields
 
 ### Risks and Mitigations
@@ -142,6 +144,7 @@ Another example is, [KubeVirt](https://github.com/kubevirt/kubevirt) runs a hype
 | **Pod Security Policy Bypass**: Feature being used in restricted environments | Integration with Pod Security Standards to block in restricted profiles |
 | **Runtime Incompatibility**: Feature not working with older runtimes | **Explicit Failure**: Kubelet rejects pods requesting `CgroupOptions` if the runtime does not support it, ensuring workloads don't run with incorrect assumptions. |
 | **cpuset Isolation**: Containers could modify `cpuset.cpus` to access CPUs allocated to other workloads by CPU Manager. | The `nsdelegate` mount option for cgroup v2 prevents containers from modifying their own resource limits (like `cpuset.cpus`). They can only create and manage sub-cgroups within their allocated constraints. |
+| **Cgroup Descendant Exhaustion**: A container could create many descendant cgroups, exhausting node-level resources (memory and `inotify` watches were observed in the experiment) that are not counted against the container's `memory.max` limit, driving the node into `NotReady`. | The kubelet sends `cgroup_max_descendants` and `cgroup_max_depth` to the runtime via CRI when writable cgroups is enabled; the runtime applies these on the container's cgroup before mounting. The kubelet sends conservative defaults at alpha (specific values TBD during implementation); optional Pod-spec overrides are added at beta with no new CRI changes required. See [Verified Behavior](#verified-behavior). |
 
 ### cpuset Isolation
 
@@ -152,6 +155,22 @@ Another example is, [KubeVirt](https://github.com/kubevirt/kubevirt) runs a hype
 The `nsdelegate` mount option for cgroup v2 provides kernel-level protection. When `/sys/fs/cgroup` is mounted with `nsdelegate`, and the container is in its own cgroup namespace, the kernel prevents the container from modifying its own resource limits. It can only create subdirectories (child cgroups) and manage resources within those sub-cgroups.
 
 This feature relies on `nsdelegate` being supported and configured on the host. If the runtime cannot ensure this isolation (e.g., missing `nsdelegate` support), it MUST NOT enable writable cgroups for the container.
+
+### Verified Behavior
+
+#### Descendant Cgroup Memory Accounting
+
+A container with `cgroupOptions.mountMode: Writable` and `memory.max: 128Mi` running on a GKE node (COS 125, kernel 6.12.68+, cgroup v2) was able to create approximately 42,000 sibling cgroups before any `mkdir` failed.
+
+During the test:
+
+- Container `memory.current` grew from 97 MB to 122 MB (within its limit).
+- Node `Slab` grew from 200 MB to over 800 MB.
+- Node `MemAvailable` dropped from 14.3 GB to ~20 MB.
+- Before `NotReady`, the node raised a `ResourceExhausted` condition for `inotify-pressure` (100% of one user's watch quota, 12,288 watches).
+- The node entered `NotReady`.
+
+The container stayed within its own `memory.max` while the node ran out of memory and exhausted the inotify watch quota of one user, so the container's memory limit alone does not bound node-level resource consumption from descendant cgroups. The kubelet sends `cgroup_max_descendants` and `cgroup_max_depth` to the runtime via CRI to enforce a bound at the container's cgroup.
 
 ## Design Details
 
@@ -235,6 +254,18 @@ message LinuxContainerSecurityContext {
     // "ReadOnly" (default) or "Writable" (allows container to manage its cgroup subtree).
     // Only effective with cgroup v2.
     string cgroup_mount_mode = 18;
+
+    // cgroup_max_descendants caps the number of descendant cgroups the container
+    // may create. Applied by the runtime on the container's cgroup before
+    // mounting when cgroup_mount_mode is "Writable". 0 means use the runtime
+    // default.
+    int64 cgroup_max_descendants = 19;
+
+    // cgroup_max_depth caps the maximum depth of the descendant cgroup tree the
+    // container may create. Applied by the runtime on the container's cgroup
+    // before mounting when cgroup_mount_mode is "Writable". 0 means use the
+    // runtime default.
+    int64 cgroup_max_depth = 20;
 }
 
 // RuntimeHandlerFeatures is extended to advertise cgroup options support
@@ -272,10 +303,10 @@ sequenceDiagram
         KubeRuntime->>KubeRuntime: convertToRuntimeSecurityContext()
         Note right of KubeRuntime: Map CgroupOptions.MountMode to CRI
 
-        KubeRuntime->>Container Runtime: CreateContainer(CgroupMountMode=Writable)
+        KubeRuntime->>Container Runtime: CreateContainer(CgroupMountMode=Writable, CgroupMaxDescendants=N, CgroupMaxDepth=D)
         
         Container Runtime->>Container Runtime: Generate OCI Spec with writable cgroups
-        Note right of Container Runtime: Mount /sys/fs/cgroup as read-write
+        Note right of Container Runtime: Set cgroup.max.descendants and cgroup.max.depth on container cgroup<br/>Mount /sys/fs/cgroup as read-write
 
         Container Runtime-->>KubeRuntime: Container created
         
@@ -430,6 +461,7 @@ Coverage for new and existing packages:
 - Feature gate enabled by default
 - E2E tests stable and passing consistently
 - At least one runtime supporting the feature in a released version
+- Optional `cgroupOptions.maxDescendants` and `cgroupOptions.maxDepth` Pod spec fields added so users can override the kubelet's alpha defaults. The CRI surface and runtime contract are unchanged from alpha.
 - User feedback incorporated from alpha testing
 
 #### GA
